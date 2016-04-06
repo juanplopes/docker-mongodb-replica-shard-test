@@ -5,9 +5,9 @@
 
 #Parâmetros:
 declare MONGODB_PORTA=27017
-declare REPLICADORES=3
+declare REPLICADORES=1
 declare GRP_REPLICADORES=2
-declare CFG_SERVERS=3
+declare CFG_SERVERS=1
 declare TEMPO_ESPERA_SUBIDA_CONFIG_SERVERS=5
 declare PREFIXO_REPLICADORES=repl
 declare PREFIXO_CONFIGURADORES=cfg
@@ -43,8 +43,10 @@ function executaDockerMongoReplicante() {
   #executa o container
   echo "docker: rodando replicante $1"
   docker run \
+      -v $PWD/key:/key \
       -P --name $1 \
       -d ericogr/mongodb \
+      --keyFile /key/test.key \
       --replSet rs$2 \
       --noprealloc --smallfiles
 }
@@ -55,13 +57,16 @@ function executaDockerMongoConfigurador() {
   #executa o container
   echo "docker: rodando configurador $1"
   docker run \
+    -v $PWD/key:/key \
     -P --name $1 \
     -d ericogr/mongodb \
     --noprealloc --smallfiles \
+    --keyFile /key/test.key \
     --configsvr \
     --dbpath /data/db \
     --port 27017
 
+  executarDockerMongoFirst $1
   executarDockerMongo $1 "db.version()"
 }
 
@@ -78,8 +83,10 @@ function executaDockerMongoRouter() {
   echo "docker: rodando router para ips $ips"
   docker run \
     -v /tmp:/mnt/tmp \
+    -v $PWD/key:/key \
     -P --name mongos1 \
     -d ericogr/mongos \
+    --keyFile /key/test.key \
     --port 27017 \
     --configdb $ips
 }
@@ -123,6 +130,28 @@ function armazenaIPs() {
   echo "IP armazenado em [$2] para [$1]: " ${IPS[$2]}
 }
 
+function executarDockerMongoFirst() {
+  DEFCMD="db.createUser({ user: 'admin', pwd: 'admin', roles: [ { role: 'root', db: 'admin' } ] })"
+  CMD=${2:-$DEFCMD}
+  while true; do
+    echo "Executando comando em docker container: $1"
+    echo " comando mongo: $CMD"
+    docker exec $1 mongo admin --eval "$CMD" #>/dev/null
+
+    execucao=$?
+
+    if [ "$execucao" -ne "0" ]; then
+      echo "Processando... aguarde nova tentativa em $TEMPO_ESPERA_SUBIDA_CONFIG_SERVERS segundos [$execucao]"
+      sleep $TEMPO_ESPERA_SUBIDA_CONFIG_SERVERS
+    else
+      break
+    fi
+
+  done
+
+  echo " execução do comando mongo finalizada!"
+}
+
 #Recebe
 #       $1 identificacao do container
 #       $2 comando javascript mongo
@@ -130,7 +159,7 @@ function executarDockerMongo() {
   while true; do
     echo "Executando comando em docker container: $1"
     echo " comando mongo: $2"
-    docker exec $1 mongo --eval "$2">/dev/null
+    docker exec $1 mongo admin -u admin -p admin --eval "$2" #>/dev/null
 
     execucao=$?
 
@@ -156,7 +185,8 @@ function configuraReplicantes() {
   for grp in $(seq 1 $GRP_REPLICADORES)
   do
     echo "adicionando grupo " $grp
-    executarDockerMongo "$PREFIXO_REPLICADORES"_"$grp"_1 "rs.initiate()"
+    executarDockerMongoFirst "$PREFIXO_REPLICADORES"_"$grp"_1 "rs.initiate({_id: 'rs$grp',members: [{_id: 0, host: '${IPS_REP[$grp][0]}:$MONGODB_PORTA'}]})"
+    #executarDockerMongoFirst "$PREFIXO_REPLICADORES"_"$grp"_1
 
     echo "IPs: " ${IPS_REP[$grp]}
     grupoServidorPrimary=1
@@ -166,7 +196,7 @@ function configuraReplicantes() {
       then
         grupoServidorPrimary=0
         echo "setando ip " $ip:$MONGODB_PORTA " para o grupo " $grp
-        executarDockerMongo "$PREFIXO_REPLICADORES"_"$grp"_1 "cfg = rs.conf(); cfg.members[0].host = '$ip:$MONGODB_PORTA'; rs.reconfig(cfg);"
+#        executarDockerMongo "$PREFIXO_REPLICADORES"_"$grp"_1 "cfg = rs.conf(); cfg.members[0].host = '$ip:$MONGODB_PORTA'; rs.reconfig(cfg);"
       else
         echo "adicionando ip " $ip:$MONGODB_PORTA " para o grupo " $grp
         executarDockerMongo "$PREFIXO_REPLICADORES"_"$grp"_1 "rs.add('$ip:$MONGODB_PORTA');"
@@ -180,6 +210,8 @@ function configuraShard() {
   #adiciona os ip's as máquinas
   # só é possivel adicionar depois de iniciar as máquinas e descobrir qual o
   # ip foi atribuído
+
+  #executarDockerMongoFirst mongos1
 
   contar=1
 
@@ -257,7 +289,8 @@ seqMaquinas 1 $CFG_SERVERS $PREFIXO_CONFIGURADORES armazenaIPs
 executaDockerMongoRouter ${IPS[1]}
 
 #---shard---
-configuraShard
+configuraShard 
 
 echo "IPs primary: $IPS_PRIMARY"
+echo "IP router:" $(docker inspect --format '{{ .NetworkSettings.IPAddress }}' mongos1)
 echo "pronto"
